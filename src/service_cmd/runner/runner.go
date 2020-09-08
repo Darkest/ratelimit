@@ -1,6 +1,10 @@
 package runner
 
 import (
+	"context"
+	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"io"
 	"math/rand"
 	"net/http"
@@ -26,12 +30,36 @@ type Runner struct {
 	statsStore stats.Store
 }
 
+// Stats for an individual rate limit config entry.
+type RequestsStats struct {
+	LastDuration stats.Gauge
+}
+
+func newRateLimitStats(statsScope stats.Scope) RequestsStats {
+	ret := RequestsStats{}
+	ret.LastDuration = statsScope.NewGauge("ratelimiter_last_duration_ns")
+	return ret
+}
+
 func NewRunner() Runner {
 	return Runner{stats.NewDefaultStore()}
 }
 
 func (runner *Runner) GetStatsStore() stats.Store {
 	return runner.statsStore
+}
+
+//Interceptor for request metrics
+func unaryServerInterceptor(rqStats RequestsStats) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		now := time.Now()
+		md, ok := metadata.FromIncomingContext(ctx)
+		fmt.Printf("MD exists: %b, MD: %s\n", ok, md)
+		resp, err := handler(ctx, req)
+		time.Sleep(time.Millisecond * 10)
+		rqStats.LastDuration.Set(uint64(time.Since(now).Nanoseconds()))
+		return resp, err
+	}
 }
 
 func (runner *Runner) Run() {
@@ -48,7 +76,8 @@ func (runner *Runner) Run() {
 		localCache = freecache.NewCache(s.LocalCacheSizeInBytes)
 	}
 
-	srv := server.NewServer("ratelimit", runner.statsStore, localCache, settings.GrpcUnaryInterceptor(nil))
+	rls := newRateLimitStats(runner.statsStore)
+	srv := server.NewServer("ratelimit", runner.statsStore, localCache, settings.GrpcUnaryInterceptor(unaryServerInterceptor(rls)))
 
 	service := ratelimit.NewService(
 		srv.Runtime(),
